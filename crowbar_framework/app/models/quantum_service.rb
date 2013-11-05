@@ -138,21 +138,32 @@ class QuantumService < ServiceObject
           net_svc.allocate_ip "default","os_sdn","host", n
         else
           net_svc.enable_interface "default", "nova_fixed", n
-          if role.default_attributes["quantum"]["networking_mode"] == "vlan"
-            # Force "use_vlan" to false in VLAN mode (linuxbridge and ovs). We
-            # need to make sure that the network recipe does NOT create the
-            # VLAN interfaces (ethX.VLAN) 
-            node = NodeObject.find_node_by_name n
-            if node.crowbar["crowbar"]["network"]["nova_fixed"]["use_vlan"]
-              @logger.info("Forcing use_vlan to false for the nova_fixed network on node #{n}")
-              node.crowbar["crowbar"]["network"]["nova_fixed"]["use_vlan"] = false
-              node.save
-            end
-          end
         end
       end
     end
+    
+    # Update mellanox_tarball path
+    nodes = NodeObject.find("roles:provisioner-server")
+    unless nodes.nil? or nodes.length < 1
+      admin_ip = nodes[0].get_network_by_type("admin")["address"]
+      web_port = nodes[0]["provisioner"]["web_port"]
+      # substitute the admin web portal
+#      role.default_attributes["quantum"]["ofed_tarball"].gsub!("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+#      role.default_attributes["quantum"]["eswitch_tarball"].gsub!("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+#      role.default_attributes["quantum"]["mellanox_tarball"].gsub!("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+#      role.default_attributes["quantum"]["ethtool_package"].gsub!("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+      ofed_tarball_path = role.default_attributes["quantum"]["ofed_tarball"].gsub("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+      eswitch_tarball_path = role.default_attributes["quantum"]["eswitch_tarball"].gsub("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+      mellanox_tarball_path = role.default_attributes["quantum"]["mellanox_tarball"].gsub("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+      ethtool_package_path = role.default_attributes["quantum"]["ethtool_package"].gsub("<ADMINWEB>", "#{admin_ip}:#{web_port}")
+      role.default_attributes["quantum"]["ofed_tarball"] = ofed_tarball_path
+      role.default_attributes["quantum"]["eswitch_tarball"] = eswitch_tarball_path
+      role.default_attributes["quantum"]["mellanox_tarball"] = mellanox_tarball_path
+      role.default_attributes["quantum"]["ethtool_package"] = ethtool_package_path
+    end
+
+    role.save
+
     @logger.debug("Quantum apply_role_pre_chef_call: leaving")
   end
-
 end

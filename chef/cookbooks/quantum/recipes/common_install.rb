@@ -21,15 +21,16 @@ if node.attribute?(:cookbook) and node[:cookbook] == "nova"
      quantum = node
 end
 
+vlan_start = node[:network][:networks][:nova_fixed][:vlan]
+vlan_end = vlan_start + 2000
+
 case quantum[:quantum][:networking_plugin]
-when "openvswitch", "cisco"
+when "openvswitch"
   quantum_agent = node[:quantum][:platform][:ovs_agent_name]
-  quantum_agent_pkg = node[:quantum][:platform][:ovs_agent_pkg]
-  plugin_cfg_path = "/etc/quantum/plugins/openvswitch/ovs_quantum_plugin.ini"
 when "linuxbridge"
   quantum_agent = node[:quantum][:platform][:lb_agent_name]
-  quantum_agent_pkg = node[:quantum][:platform][:lb_agent_pkg]
-  plugin_cfg_path = "/etc/quantum/plugins/linuxbridge/linuxbridge_conf.ini"
+when "mellanox"
+  quantum_agent = node[:quantum][:platform][:mlnx_agent_name]
 end
 
 quantum_path = "/opt/quantum"
@@ -46,7 +47,7 @@ else
   keystone = quantum
 end
 
-if quantum[:quantum][:networking_plugin] == "openvswitch" or quantum[:quantum][:networking_plugin] == "cisco"
+if quantum[:quantum][:networking_plugin] == "openvswitch"
 
   if node.platform == "ubuntu"
     # If we expect to install the openvswitch module via DKMS, but the module
@@ -72,15 +73,171 @@ if quantum[:quantum][:networking_plugin] == "openvswitch" or quantum[:quantum][:
   end
 end
 
-unless quantum[:quantum][:use_gitrepo]
-  package quantum_agent_pkg do
-    action :install
+if quantum[:quantum][:networking_plugin] == "mellanox"
+
+  # Install OFED driver
+
+  ofed_url = quantum[:quantum][:ofed_tarball]
+  ofed_filename = ofed_url.split('/').last
+  
+  remote_file ofed_url do
+    source ofed_url
+    path File.join("tmp",ofed_filename)
+    action :create_if_missing
   end
 
-  link plugin_cfg_path do
-    to "/etc/quantum/quantum.conf"
-  end 
+  cookbook_file "/etc/grub.d/02_iommu" do
+    source "02_iommu"
+    action :create_if_missing
+  end
+  
+  execute "update-grub-mlnx" do
+   command "update-grub"
+   action :nothing
+  end
 
+
+  cookbook_file "/etc/modprobe.d/mlnx4_core.conf" do
+    source "mlx4_core.conf"
+    action :create_if_missing
+  end
+
+  package "linux-headers-generic"
+  package "quantum-common" # fix dependencies
+  
+  ruby_block "unset_reboot" do
+    block do
+      node.set[:reboot] = "complete"
+      node.save
+    end
+    action :create
+  end
+
+  ruby_block "set_reboot" do
+    block do
+      node.set[:reboot] = "require"
+      node.save
+    end
+    action :create
+    not_if "lsmod | grep mlx4_en"
+    notifies :run, "execute[update-grub-mlnx]", :immediately
+  end
+
+  bash "install_ofed" do
+    cwd "/tmp"
+    code "tar zxf #{ofed_filename} && cd MLNX_OFED_LINUX-2.0-3.0.0-ubuntu12.04-x86_64 && ./mlnxofedinstall -q --enable-sriov --force-fw-update && touch /etc/ofed_installed"
+    not_if { ::File.exists?("/etc/ofed_installed") }
+    notifies :create, "ruby_block[set_reboot]"
+  end
+
+  # Download and unpack mellanox tarball
+
+  tarball_url = quantum[:quantum][:mellanox_tarball]
+  mellanox_filename = tarball_url.split('/').last
+  eswitch_url = quantum[:quantum][:eswitch_tarball]
+  eswitch_filename = eswitch_url.split('/').last
+  ethtool_url = quantum[:quantum][:ethtool_package]
+  ethtool_filename = ethtool_url.split('/').last
+
+  remote_file ethtool_url do
+    source ethtool_url
+    path File.join("tmp",ethtool_filename)
+    action :create_if_missing
+  end
+
+  bash "install_ethtool" do
+    cwd "/tmp"
+    code "dpkg -i #{ethtool_filename}"
+    not_if { `dpkg -l | grep ethtool | grep 3.9` } #should be fixed to check actual ethtool package
+  end  
+
+  package "unzip"
+  package "python-zmq"
+
+  remote_file tarball_url do
+    source tarball_url
+    path File.join("tmp",mellanox_filename)
+    action :create_if_missing
+  end
+
+  directory "/usr/lib/python2.7/dist-packages/nova/virt/libvirt" do
+    action :create
+    recursive true
+  end
+ 
+  directory "/usr/lib/python2.7/dist-packages/quantum/plugins" do
+    action :create
+    recursive true
+  end
+
+  bash "install_mellanox_agent_from_archive" do
+    cwd "/tmp"
+    code "unzip -o #{mellanox_filename} && cd mellanox-quantum-plugin-stable-grizzly && cp -a nova/nova/virt/libvirt/mlnx /usr/lib/python2.7/dist-packages/nova/virt/libvirt && cp -a quantum/quantum/plugins/mlnx /usr/lib/python2.7/dist-packages/quantum/plugins && cp -a daemon /opt/mlnx_daemon && cd .. && rm -Rf mellanox-quantum-plugin-stable-grizzly && rm #{mellanox_filename} && touch /etc/mlnx_installed"
+    not_if { ::File.exists?("/etc/mlnx_installed") }
+  end
+
+  package "python-ethtool"
+
+  remote_file eswitch_url do
+    source eswitch_url
+    path File.join("tmp",eswitch_filename)
+    action :create_if_missing
+  end
+
+  bash "install_eswitch" do
+    cwd "/tmp"
+    code "unzip #{eswitch_filename} && cd mellanox-eswitchd-0.4 && python setup.py build && python setup.py install && touch /etc/eswitch_installed"
+    not_if { ::File.exists?("/etc/eswitch_installed") }
+  end  
+
+  directory "/etc/eswitchd"
+  directory "/var/log/eswitchd"
+
+  directory "/etc/quantum/plugins/mlnx"
+
+  template "/etc/quantum/plugins/mlnx/mlnx_conf.ini" do
+    cookbook "quantum"
+    source "mlnx_conf.ini.erb"
+    mode "0640"
+    owner node[:quantum][:platform][:user]
+    variables(
+      :vlan_start => vlan_start,
+      :vlan_end => vlan_end,
+      :sql_connection => quantum[:quantum][:db][:sql_connection]
+    )
+  end
+
+  link_service "eswitchd" do
+    bin_name "eswitchd --config-file /etc/eswitchd/eswitchd.conf"
+  end
+
+  service "eswitchd" do
+    supports :status => true, :restart => true
+    action :enable
+    #subscribes :restart, resources("template[/etc/eswitchd/eswitchd.conf]")
+    #notifies :restart, "service[quantum-plugin-mellanox-agent]"
+  end
+
+  template "/etc/eswitchd/eswitchd.conf" do
+    cookbook "quantum"
+    source "mlnx_daemon.conf.erb"
+    mode "0640"
+    owner node[:quantum][:platform][:user]
+    variables(
+      :debug => quantum[:quantum][:debug],
+      :verbose => quantum[:quantum][:verbose]
+    )
+    notifies :restart, "service[eswitchd]"
+  end
+
+end  
+
+unless quantum[:quantum][:use_gitrepo]
+  unless quantum[:quantum][:networking_plugin] == "mellanox"
+    package quantum_agent do
+      action :install
+    end
+  end    
 else
   quantum_agent = "quantum-openvswitch-agent"
   pfs_and_install_deps "quantum" do
@@ -101,16 +258,12 @@ else
 
   link_service quantum_agent do
     virtualenv venv_path
-    bin_name "quantum-openvswitch-agent --config-file #{plugin_cfg_path} --config-dir /etc/quantum/"
+    bin_name "quantum-openvswitch-agent --config-dir /etc/quantum/"
   end
 
   execute "quantum_cp_policy.json" do
     command "cp /opt/quantum/etc/policy.json /etc/quantum/"
     creates "/etc/quantum/policy.json"
-  end
-  execute "quantum_cp_plugins" do
-    command "cp -r /opt/quantum/etc/quantum/plugins /etc/quantum/plugins"
-    creates "/etc/quantum/plugins"
   end
   execute "quantum_cp_rootwrap" do
     command "cp -r /opt/quantum/etc/quantum/rootwrap.d /etc/quantum/rootwrap.d"
@@ -121,32 +274,6 @@ else
     source "quantum-rootwrap.conf"
     mode 00644
     owner node[:quantum][:platform][:user]
-  end
-
-  case quantum[:quantum][:networking_plugin]
-  when "openvswitch"
-    template plugin_cfg_path do
-      cookbook "quantum"
-      source "ovs_quantum_plugin.ini.erb"
-      owner quantum[:quantum][:platform][:user]
-      group "root"
-      mode "0640"
-      variables(
-          :ovs_sql_connection => quantum[:quantum][:db][:sql_connection],
-          :rootwrap_bin =>  node[:quantum][:rootwrap]
-      )
-    end
-  when "linuxbridge"
-    template plugin_cfg_path do
-      cookbook "quantum"
-      source "linuxbridge_conf.ini.erb"
-      owner quantum[:quantum][:platform][:user]
-      group "root"
-      mode "0640"
-      variables(
-          :sql_connection => quantum[:quantum][:db][:sql_connection]
-      )
-    end
   end
 end
 
@@ -184,26 +311,20 @@ template node[:quantum][:platform][:quantum_rootwrap_sudo_template] do
 end
 
 case quantum[:quantum][:networking_plugin]
-when "openvswitch", "cisco"
+when "openvswitch"
   plugin_cfg_path = "/etc/quantum/plugins/openvswitch/ovs_quantum_plugin.ini"
   physnet = quantum[:quantum][:networking_mode] == 'gre' ? "br-tunnel" : "br-fixed"
   interface_driver = "quantum.agent.linux.interface.OVSInterfaceDriver"
   external_network_bridge = "br-public"
-  
-  if %w(redhat centos).include?(node.platform)
-    openvswitch_service = "openvswitch"
-  else
-    openvswitch_service = "openvswitch-switch"
-  end
-  service "openvswitch_service" do
-    service_name openvswitch_service
+
+  service "openvswitch-switch" do
     supports :status => true, :restart => true
     action [ :enable ]
   end
 
-  bash "Start #{openvswitch_service} service" do
-    code "service #{openvswitch_service} start"
-    only_if "service #{openvswitch_service} status |grep -q 'is not running'"
+  bash "Start openvswitch-switch service" do
+    code "service openvswitch-switch start"
+    only_if "service openvswitch-switch status |grep -q 'is not running'"
   end
 
   # We always need br-int.  Quantum uses this bridge internally.
@@ -246,8 +367,14 @@ when "openvswitch", "cisco"
     end
   end
 when "linuxbridge"
+  plugin_cfg_path = "/etc/quantum/plugins/linuxbridge/linuxbridge_conf.ini"
   physnet = (node[:crowbar_wall][:network][:nets][:nova_fixed].first rescue nil)
   interface_driver = "quantum.agent.linux.interface.BridgeInterfaceDriver"
+  external_network_bridge = ""
+when "mellanox"
+  plugin_cfg_path = "/etc/quantum/plugins/mlnx/mlnx_conf.ini"
+  physnet = (node[:crowbar_wall][:network][:nets][:nova_fixed].first rescue nil)
+  #interface_driver = "quantum.agent.linux.interface.BridgeInterfaceDriver"
   external_network_bridge = ""
 end
 
@@ -302,73 +429,72 @@ admin_username = keystone["keystone"]["admin"]["username"] rescue nil
 admin_password = keystone["keystone"]["admin"]["password"] rescue nil
 Chef::Log.info("Keystone server found at #{keystone_host}")
 
-vlan_start = node[:network][:networks][:nova_fixed][:vlan]
-vlan_end = vlan_start + 2000
 
-if %w(redhat centos).include?(node.platform)
- link "/etc/quantum/plugin.ini" do
-   to "/etc/quantum/quantum.conf"
- end
+if quantum[:quantum][:use_gitrepo] == true
+  plugin_cfg_path = File.join("/opt/quantum", plugin_cfg_path)
 end
+
+#link plugin_cfg_path do
+#  to "/etc/quantum/quantum.conf"
+#end
 
 if quantum_server and quantum[:quantum][:api][:protocol] == 'https'
   if quantum[:quantum][:ssl][:generate_certs]
     package "openssl"
-    ruby_block "generate_certs for quantum" do
-      block do
-        unless ::File.exists? node[:quantum][:ssl][:certfile] and ::File.exists? node[:quantum][:ssl][:keyfile]
-          require "fileutils"
 
-          Chef::Log.info("Generating SSL certificate for quantum...")
+    require "fileutils"
+    [:certfile, :keyfile, :ca_certs].each do |k|
+      dir = File.dirname(quantum[:quantum][:ssl][k])
+      if File.exists?(dir)
+        FileUtils.chown_R quantum[:quantum][:user], quantum[:quantum][:group], dir
+      else
+        FileUtils.mkdir_p(dir) {|d| File.chown quantum[:quantum][:user], quantum[:quantum][:group], d}
+      end
+    end
 
-          [:certfile, :keyfile].each do |k|
-            dir = File.dirname(quantum[:quantum][:ssl][k])
-            FileUtils.mkdir_p(dir) unless File.exists?(dir)
-          end
+    # Some more ownership fixes:
+    conf_dir = File.dirname quantum[:quantum][:ssl][:ca_certs]
+    FileUtils.chown "root", quantum[:quantum][:group], conf_dir
+    FileUtils.chown "root", quantum[:quantum][:group], File.expand_path("#{conf_dir}/..")  # /etc/quantum/ssl
 
-          # Generate private key
-          %x(openssl genrsa -out #{quantum[:quantum][:ssl][:keyfile]} 4096)
-          if $?.exitstatus != 0
-            message = "SSL private key generation failed"
-            Chef::Log.fatal(message)
-            raise message
-          end
-          FileUtils.chown "root", quantum[:quantum][:group], quantum[:quantum][:ssl][:keyfile]
-          FileUtils.chmod 0640, node[:quantum][:ssl][:keyfile]
-
-          # Generate certificate signing requests (CSR)
-          conf_dir = File.dirname quantum[:quantum][:ssl][:certfile]
-          ssl_csr_file = "#{conf_dir}/signing_key.csr"
-          ssl_subject = "\"/C=US/ST=Unset/L=Unset/O=Unset/CN=#{quantum[:fqdn]}\""
-          %x(openssl req -new -key #{quantum[:quantum][:ssl][:keyfile]} -out #{ssl_csr_file} -subj #{ssl_subject})
-          if $?.exitstatus != 0
-            message = "SSL certificate signed requests generation failed"
-            Chef::Log.fatal(message)
-            raise message
-          end
-
-          # Generate self-signed certificate with above CSR
-          %x(openssl x509 -req -days 3650 -in #{ssl_csr_file} -signkey #{quantum[:quantum][:ssl][:keyfile]} -out #{quantum[:quantum][:ssl][:certfile]})
-          if $?.exitstatus != 0
-            message = "SSL self-signed certificate generation failed"
-            Chef::Log.fatal(message)
-            raise message
-          end
-
-          File.delete ssl_csr_file  # Nobody should even try to use this
-        end # unless files exist
-      end # block
-    end # ruby_block
-  else # if generate_certs
-    unless ::File.exists? quantum[:quantum][:ssl][:certfile]
-      message = "Certificate \"#{quantum[:quantum][:ssl][:certfile]}\" is not present."
+    require "fileutils"
+    # Generate private key
+    %x(openssl genrsa -out #{quantum[:quantum][:ssl][:keyfile]} 4096)
+    if $?.exitstatus != 0
+      message = "SSL private key generation failed"
       Chef::Log.fatal(message)
       raise message
     end
-    # we do not check for existence of keyfile, as the private key is allowed
-    # to be in the certfile
-  end # if generate_certs
+    FileUtils.chown quantum[:quantum][:user], quantum[:quantum][:group], quantum[:quantum][:ssl][:keyfile]
 
+    # Generate certificate signing requests (CSR)
+    ssl_csr_file = "#{conf_dir}/signing_key.csr"
+    ssl_subject = "\"/C=US/ST=Unset/L=Unset/O=Unset/CN=#{quantum[:fqdn]}\""
+    %x(openssl req -new -key #{quantum[:quantum][:ssl][:keyfile]} -out #{ssl_csr_file} -subj #{ssl_subject})
+    if $?.exitstatus != 0
+      message = "SSL certificate signed requests generation failed"
+      Chef::Log.fatal(message)
+      raise message
+    end
+
+    # Generate self-signed certificate with above CSR
+    %x(openssl x509 -req -days 3650 -in #{ssl_csr_file} -signkey #{quantum[:quantum][:ssl][:keyfile]} -out #{quantum[:quantum][:ssl][:certfile]})
+    if $?.exitstatus != 0
+      message = "SSL self-signed certificate generation failed"
+      Chef::Log.fatal(message)
+      raise message
+    end
+
+    File.delete ssl_csr_file  # Nobody should even try to use this
+  end
+
+  unless ::File.exists? quantum[:quantum][:ssl][:certfile]
+    message = "Certificate \"#{quantum[:quantum][:ssl][:certfile]}\" is not present."
+    Chef::Log.fatal(message)
+    raise message
+  end
+  # we do not check for existence of keyfile, as the private key is allowed to
+  # be in the certfile
   if quantum[:quantum][:ssl][:cert_required] and !::File.exists? quantum[:quantum][:ssl][:ca_certs]
     message = "Certificate CA \"#{quantum[:quantum][:ssl][:ca_certs]}\" is not present."
     Chef::Log.fatal(message)
@@ -383,8 +509,9 @@ template "/etc/quantum/quantum.conf" do
     owner node[:quantum][:platform][:user]
     variables(
       :sql_connection => quantum[:quantum][:db][:sql_connection],
+      :sql_idle_timeout => quantum[:quantum][:sql][:idle_timeout],
       :sql_min_pool_size => quantum[:quantum][:sql][:min_pool_size],
-      :sql_max_pool_overflow => quantum[:quantum][:sql][:max_pool_overflow],
+      :sql_max_pool_size => quantum[:quantum][:sql][:max_pool_size],
       :sql_pool_timeout => quantum[:quantum][:sql][:pool_timeout],
       :debug => quantum[:quantum][:debug],
       :verbose => quantum[:quantum][:verbose],
@@ -419,6 +546,12 @@ template "/etc/quantum/quantum.conf" do
     )
 end
 
+if quantum[:quantum][:networking_plugin] == "mellanox"
+  link_service quantum_agent do
+    bin_name "python /usr/lib/python2.7/dist-packages/quantum/plugins/mlnx/agent/eswitch_quantum_agent.py --config-file /etc/quantum/quantum.conf  --config-file /etc/quantum/plugins/mlnx/mlnx_conf.ini"
+  end
+end
+
 if quantum_server
   # no subscribes for :restart; this is handled by the
   # "mark quantum-agent as restart for post-install" ruby_block
@@ -431,45 +564,7 @@ else
   service quantum_agent do
     supports :status => true, :restart => true
     action :enable
-    subscribes :restart, resources("link[#{plugin_cfg_path}]") unless quantum[:quantum][:use_gitrepo]
-    subscribes :restart, resources("template[#{plugin_cfg_path}]") if quantum[:quantum][:use_gitrepo]
+    #subscribes :restart, resources("link[#{plugin_cfg_path}]")
     subscribes :restart, resources("template[/etc/quantum/quantum.conf]")
   end
 end
-
-
-if %w(redhat centos).include?(node.platform)
-  net_core_pkgs=%w(kernel iproute iputils)
-
-  ruby_block "unset_reboot" do
-    block do
-      node.set[:reboot] = "complete"
-      node.save
-    end
-    action :create
-  end
-
-  ruby_block "set_reboot" do
-    block do
-      node.set[:reboot] = "require"
-      node.save
-    end
-    action :create
-    not_if "uname -a | grep 'openstack'"
-  end
-
-  net_core_pkgs.each do |pkg|
-    package "#{pkg}" do
-      action :upgrade
-      notifies :create, "ruby_block[set_reboot]"
-    end
-  end
-  #quantum tries to use v6 ip utils but rhel not support for v6, so lets workaround this issue this way
-  link "/sbin/ip6tables-restore" do
-    to "/bin/true"
-  end
-  link "/sbin/ip6tables-save" do
-    to "/bin/true"
-  end
-end
-
