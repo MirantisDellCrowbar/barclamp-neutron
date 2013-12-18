@@ -25,6 +25,7 @@ use_syslog = <%= @use_syslog ? "True" : "False" %>
 # syslog_log_facility = LOG_LOCAL0
 
 
+rpc_backend=<%= @node[:neutron][:amqp_backend] %>
 <% if @rabbit_settings -%>
 rabbit_host=<%= @rabbit_settings[:address] %>
 <% unless @rabbit_settings[:port].nil? -%>
