@@ -99,10 +99,10 @@ debs:
 rpms:
   centos-6.4:
     repos:
-      - rpm http://repos.fedorapeople.org/repos/openstack/openstack-havana/epel-6
+      - rpm http://repos.fedorapeople.org/repos/openstack/openstack-havana/epel-6/rdo-release-havana-7.noarch.rpm
   redhat-6.4:
     repos:
-      - rpm http://repos.fedorapeople.org/repos/openstack/openstack-havana/epel-6
+      - rpm http://repos.fedorapeople.org/repos/openstack/openstack-havana/epel-6/rdo-release-havana-7.noarch.rpm
   pkgs:
     - openstack-neutron
     - openstack-neutron-linuxbridge
