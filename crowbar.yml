@@ -76,7 +76,7 @@ rpms:
     - kernel-headers
 
 pips:
-  - pyudev
+#  - pyudev
 
 git_repo:
   - neutron https://github.com/openstack/neutron.git stable/havana
