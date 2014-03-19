@@ -18,8 +18,9 @@ include_recipe "neutron::common_agent"
 
 
 unless node[:neutron][:use_gitrepo]
-  pkgs = [ node[:neutron][:platform][:dhcp_agent_pkg], node[:neutron][:platform][:l3_agent_pkg], node[:neutron][:platform][:metadata_agent_pkg], node[:neutron][:platform][:metering_agent_pkg] ]
+  pkgs = [ node[:neutron][:platform][:dhcp_agent_pkg], node[:neutron][:platform][:l3_agent_pkg], node[:neutron][:platform][:metadata_agent_pkg] ]
   pkgs.uniq.each { |p| package p }
+  pacakage node[:neutron][:platform][:metering_agent_pkg] if node[:platform] == "suse"
 else
   neutron_path = "/opt/neutron"
   venv_path = node[:neutron][:use_virtualenv] ? "#{neutron_path}/.venv" : nil
@@ -39,6 +40,7 @@ else
   link_service "neutron-metering-agent" do
     virtualenv venv_path
     bin_name "neutron-metering-agent --config-dir /etc/neutron/ --config-file /etc/neutron/metering_agent.ini"
+    only_if { node[:platform] == "suse" }
   end
 end
 
